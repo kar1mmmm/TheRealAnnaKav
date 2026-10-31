@@ -1,0 +1,12 @@
+{
+  "name": "annakav-gui",
+  "version": "0.1.4",
+  "description": "Electron Desktop GUI for TheRealAnnaKav Antivirus & Hashmap Engine",
+  "main": "main.js",
+  "scripts": {
+    "start": "electron ."
+  },
+  "devDependencies": {
+    "electron": "^45.2.1"
+  }
+}

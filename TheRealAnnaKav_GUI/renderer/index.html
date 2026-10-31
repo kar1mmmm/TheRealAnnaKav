@@ -1,0 +1,211 @@
+<!DOCTYPE html>
+<html lang="id">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>TheRealAnnaKav v0.1.4 — Antivirus & SHA-256 Hashmap GUI</title>
+  <link rel="stylesheet" href="styles.css" />
+</head>
+<body>
+  <div class="app-shell">
+    <!-- Sidebar -->
+    <aside class="sidebar">
+      <div class="brand">
+        <div class="logo-box">AK</div>
+        <div>
+          <h1>AnnaKav <span class="ver">v0.1.4</span></h1>
+          <p>SHA-256 & O(1) Hashmap AV</p>
+        </div>
+      </div>
+
+      <nav class="nav">
+        <button class="nav-item active" data-tab="scanner">
+          <span class="idx">01</span> DFS File Scanner
+        </button>
+        <button class="nav-item" data-tab="hashmap">
+          <span class="idx">02</span> Hashmap Table (SL=10)
+        </button>
+        <button class="nav-item" data-tab="readwritedb">
+          <span class="idx">03</span> DB Signature Writer
+        </button>
+        <button class="nav-item" data-tab="security">
+          <span class="idx">04</span> WAFPrev & Checkpoint
+        </button>
+      </nav>
+
+      <div class="mascot-card">
+        <img src="../Etherane/Anna/chlara and her sister.png" alt="Chlara" onerror="this.style.display='none'" />
+        <div class="mascot-caption">
+          <strong>Etherane / AnnaVault</strong>
+          <span>"We aren't cheap, We cost a lot of time and space"</span>
+        </div>
+      </div>
+    </aside>
+
+    <!-- Main Content -->
+    <main class="content">
+      <!-- TAB 1: SCANNER -->
+      <section class="tab-page active" id="tab-scanner">
+        <header class="page-header">
+          <div>
+            <h2>DFS Directory Walker & Malware Lookup (`util.c`)</h2>
+            <p>Telusuri folder/file, hitung SHA-256 (`HashAfile`), dan cocokkan dengan O(1) Hashmap (`get()`).</p>
+          </div>
+          <div class="btn-group">
+            <button id="btnPickFiles" class="btn-outline">+ Pilih File</button>
+            <button id="btnPickFolder" class="btn-outline">+ Pilih Folder</button>
+            <button id="btnScanDbFolder" class="btn-outline" title="Uji coba scan langsung isi folder db/">⚡ Test Scan Folder db/</button>
+            <button id="btnRunScan" class="btn-primary">▶ Jalankan Scan</button>
+          </div>
+        </header>
+
+        <div class="filter-bar">
+          <div id="selectedTargetDisplay" class="target-pill">
+            Target: Belum ada file/folder dipilih (Klik "+ Pilih File", "+ Pilih Folder", atau "⚡ Test Scan Folder db/")
+          </div>
+          <label class="checkbox-label">
+            <input type="checkbox" id="chkExecOnly" />
+            <span>Hanya scan file Executable (`st_mode & S_IEXEC`)</span>
+          </label>
+        </div>
+
+        <div class="stats-row">
+          <div class="stat-box">
+            <span>Total File Diperiksa</span>
+            <strong id="statTotal">0</strong>
+          </div>
+          <div class="stat-box">
+            <span>Malware Terdeteksi (`get(H) != NULL`)</span>
+            <strong id="statMalware" class="danger">0</strong>
+          </div>
+          <div class="stat-box">
+            <span>Slot Hashmap Terisi (`db/`)</span>
+            <strong id="statHmLoaded" class="accent">10 / 10</strong>
+          </div>
+          <div class="stat-box">
+            <span>Status Mesin</span>
+            <strong id="statStatus">IDLE</strong>
+          </div>
+        </div>
+
+        <div class="split-pane">
+          <div class="table-wrap">
+            <table>
+              <thead>
+                <tr>
+                  <th>Nama File</th>
+                  <th>Ukuran</th>
+                  <th>SHA-256 (`%08x` x 8)</th>
+                  <th>Match DB (`hashtable[t]->name`)</th>
+                  <th>Status</th>
+                </tr>
+              </thead>
+              <tbody id="scanTableBody">
+                <tr>
+                  <td colspan="5" class="empty">Belum ada pemindaian. Klik tombol "⚡ Test Scan Folder db/" atau pilih file untuk memulai.</td>
+                </tr>
+              </tbody>
+            </table>
+          </div>
+
+          <div class="log-panel">
+            <div class="log-header">
+              <span>STDOUT TERMINAL (`annakav.c`)</span>
+              <button id="btnClearLog" class="btn-mini">Clear</button>
+            </div>
+            <pre id="terminalLog"></pre>
+          </div>
+        </div>
+      </section>
+
+      <!-- TAB 2: HASHMAP TABLE -->
+      <section class="tab-page" id="tab-hashmap">
+        <header class="page-header">
+          <div>
+            <h2>Hashmap O(1) Lookup Inspector (`hashmap.c` — `SL = 10`)</h2>
+            <p>Visualisasi fungsi `hmload()`, `Ihash(sha) % 10`, dan *Linear Probing* saat terjadi *collision* pada folder `db/`.</p>
+          </div>
+          <button id="btnReloadHm" class="btn-primary">↻ Reload `hmload()`</button>
+        </header>
+
+        <div class="table-wrap">
+          <table>
+            <thead>
+              <tr>
+                <th>Index Slot (`j`)</th>
+                <th>Nama File Signature (`name`)</th>
+                <th>Hash `Ihash(sha) % 10` Awal</th>
+                <th>Collision Probes</th>
+                <th>Nilai `u32t sha[8]` (`printf("%08x")`)</th>
+              </tr>
+            </thead>
+            <tbody id="hmTableBody"></tbody>
+          </table>
+        </div>
+      </section>
+
+      <!-- TAB 3: READWRITEDB -->
+      <section class="tab-page" id="tab-readwritedb">
+        <header class="page-header">
+          <div>
+            <h2>Database Signature Generator (`readwritedb.c`)</h2>
+            <p>Hash file sampel menjadi array `u32t HforDB[8]` (32-byte binary) dan simpan ke dalam folder `db/`.</p>
+          </div>
+        </header>
+
+        <div class="card-form">
+          <div class="form-row">
+            <label>1. File Sumber (`argv[1]`)</label>
+            <div class="input-with-btn">
+              <input type="text" id="rwSourcePath" placeholder="Pilih file yang akan di-hash..." readonly />
+              <button id="btnRwPick" class="btn-outline">Pilih File</button>
+            </div>
+          </div>
+
+          <div class="form-row">
+            <label>2. Nama File Output di `db/` (`argv[2]`)</label>
+            <input type="text" id="rwOutputName" placeholder="Contoh: malware_sample.bin atau hi5.txt" value="custom_sig.bin" />
+          </div>
+
+          <button id="btnRwGenerate" class="btn-primary">💾 Hash & Tulis 32-Byte ke `db/`</button>
+
+          <div id="rwResultBox" class="result-banner hidden"></div>
+        </div>
+      </section>
+
+      <!-- TAB 4: WAFPREV & CHECKPOINT -->
+      <section class="tab-page" id="tab-security">
+        <header class="page-header">
+          <div>
+            <h2>Weak File Permission (`WAFPrev`) & Scan Checkpoint (`chprelated.c`)</h2>
+            <p>Pemeriksaan izin `/etc/passwd` (0644), `/etc/shadow` (0600), dan pencatatan waktu pindai di `log.bin`.</p>
+          </div>
+          <button id="btnRefreshSec" class="btn-outline">↻ Refresh Status</button>
+        </header>
+
+        <div class="sec-grid">
+          <div class="sec-card">
+            <h3>🔒 `/etc/passwd` Permission Check</h3>
+            <p class="muted">Aturan Patch v0.1.3: Wajib <code>0644</code> (Group & Others dilarang memiliki akses tulis).</p>
+            <div class="sec-status" id="secPasswd">Memeriksa...</div>
+          </div>
+
+          <div class="sec-card">
+            <h3>🛡️ `/etc/shadow` Permission Check</h3>
+            <p class="muted">Aturan Patch v0.1.3: Wajib <code>0600</code> (Hanya root/owner yang boleh membaca & menulis).</p>
+            <div class="sec-status" id="secShadow">Memeriksa...</div>
+          </div>
+
+          <div class="sec-card">
+            <h3>⏱️ Checkpoint Log (`log.bin`)</h3>
+            <p class="muted">Menyimpan <code>time_t</code> kapan terakhir kali AnnaKav selesai melakukan pemindaian.</p>
+            <div class="sec-status" id="secCheckpoint">Memeriksa...</div>
+          </div>
+        </div>
+      </section>
+    </main>
+  </div>
+
+  <script src="app.js"></script>
+</body>
+</html>
