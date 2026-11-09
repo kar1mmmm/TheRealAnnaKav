@@ -1,4 +1,5 @@
 #include "sha.h"
+#include <errno.h>
 
 const u32t H2[64] = { 
       0x428a2f98, 0x71374491, 0xb5c0fbcf, 0xe9b5dba5, 
@@ -21,7 +22,9 @@ const u32t H2[64] = {
 
 
 unsigned char * Greg_bitLOC(unsigned char * Sinput, int len, u64t Tot){
-      if(len > 54){
+      //fix: 55 bytes of data + 0x80 + 8 bytes length still fit in one block,
+      //so only 56..64 bytes need an extra length block (was len > 54)
+      if(len > 55){
             unsigned char * gBIT = calloc(64, 1); 
             for (int i = 0 ; i < len; i++){
                   gBIT[i] = Sinput[i];
@@ -183,90 +186,80 @@ u32t * MultiSha (unsigned char * hasi, u32t * H, size_t len, u64t fs){
 }
 
 
-u32t * HashAfile(char * path){
-      struct stat file;
-      ssize_t n ;
-      unsigned char buf[BUFSIZ];
+//read() may return less than asked even before EOF, so keep reading until
+//we got `want` bytes, hit EOF, or a real error happens.
+static ssize_t readFull(int Pp, unsigned char *buf, size_t want){
+      size_t got = 0;
+      while (got < want){
+            ssize_t n = read(Pp, buf + got, want - got);
+            if (n == 0) break;            //EOF
+            if (n < 0){
+                  if (errno == EINTR) continue;
+                  return -1;
+            }
+            got += (size_t)n;
+      }
+      return (ssize_t)got;
+}
 
-      system("pwd");
+//feed one full 64 byte block to the compression function
+static u32t * shaBlock(unsigned char *block, u32t *H){
+      if (H == NULL) return sha256(block, 64, 0);   //first block -> init H
+      return MultiSha(block, H, 64, 0);
+}
+
+//Streaming SHA-256 over an open file descriptor.
+//Fix for v0.1.4: the old version skipped the final padding block when the
+//file size was a multiple of 64, or when the last chunk was 55..63 bytes.
+//Now padding (0x80 + 64-bit big endian length) is always appended at the end
+//and the length comes from the bytes actually read, not st_size.
+static u32t * shaFromFd(int Pp){
+      unsigned char block[128];
+      u32t *H = NULL;
+      u64t total = 0;
+      ssize_t n;
+
+      for (;;){
+            n = readFull(Pp, block, 64);
+            if (n < 0){
+                  free(H);
+                  return NULL;
+            }
+            total += (u64t)n;
+            if (n < 64) break;            //remaining tail (0..63 bytes)
+            H = shaBlock(block, H);
+      }
+
+      //padding: 0x80, zeros, then length -> 1 block if tail <= 55, else 2 blocks
+      size_t padLen = (n <= 55) ? 64 : 128;
+      memset(block + n, 0, sizeof(block) - (size_t)n);
+      block[n] = 0x80;
+
+      u64t bitLen = total * 8;
+      for (int i = 0; i < 8; i++){
+            block[padLen - 1 - i] = (unsigned char)(bitLen >> (8 * i));
+      }
+
+      for (size_t off = 0; off < padLen; off += 64){
+            H = shaBlock(block + off, H);
+      }
+
+      return H;
+}
+
+u32t * HashAfile(char * path){
       int Pp = open(path, O_RDONLY);
       if (Pp == -1){
             printf("Can't open the file\t\t This error from Hash a file function\n");
             return NULL;
       }
 
-      fstat(Pp, &file);
-
-      n = read(Pp, buf,64);
-
-      if (file.st_size <= 55){
-            u32t * H = sha256(buf, n, file.st_size);
-            close(Pp);
-            return H;
-      }
-
-      else if (file.st_size > 55 && file.st_size < 64){
-            u32t * H = sha256(buf, n, file.st_size);
-            n = read(Pp, buf,64);
-            H = MultiSha(buf, H, n, file.st_size);
-            close(Pp);
-            return H;
-      }
-
-      else {
-            u32t * H = sha256(buf, n, file.st_size);
-            n = read(Pp, buf,64);
-            int i =0; 
-
-            while (n > 0){
-                  H = MultiSha(buf, H, n, file.st_size);
-                  n = read(Pp, buf,64);
-                  if (n > 55 && n < 64){
-                        i = 1;
-
-                  }
-            }
-
-            close(Pp);
-            return H;
-      }
-
+      u32t * H = shaFromFd(Pp);
+      close(Pp);
+      return H;
 }
 
 u32t * HashAfileByFp(int Pp, struct stat *file ){
-      ssize_t n ;
-      unsigned char buf[BUFSIZ];
-
-      fstat(Pp, file);
-
-      n = read(Pp, buf,64);
-
-      if (file->st_size <= 55){
-            u32t * H = sha256(buf, n, file->st_size);
-            return H;
-      }
-
-      else if (file->st_size > 55 && file->st_size < 64){
-            u32t * H = sha256(buf, n, file->st_size);
-            n = read(Pp, buf,64);
-            H = MultiSha(buf, H, n, file->st_size);
-            return H;
-      }
-
-      else {
-            u32t * H = sha256(buf, n, file->st_size);
-            n = read(Pp, buf,64);
-            int i =0; 
-
-            while (n > 0){
-                  H = MultiSha(buf, H, n, file->st_size);
-                  n = read(Pp, buf,64);
-                  if (n > 55 && n < 64){
-                        i = 1;
-
-                  }
-            }
-
-            return H;
-      }
+      if (file != NULL) fstat(Pp, file);
+      return shaFromFd(Pp);
 }

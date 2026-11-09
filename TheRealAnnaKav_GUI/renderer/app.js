@@ -1,5 +1,16 @@
 let currentTargets = [];
 
+// Escape semua data dinamis (nama file, path, dll) sebelum dimasukkan ke innerHTML
+// agar nama file berbahaya seperti `<img src=x onerror=...>.exe` tidak dieksekusi (XSS).
+function escapeHtml(value) {
+  return String(value ?? '')
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;')
+    .replace(/'/g, '&#39;');
+}
+
 // Tab Navigation
 document.querySelectorAll('.nav-item').forEach(btn => {
   btn.addEventListener('click', () => {
@@ -48,11 +59,11 @@ async function loadHashmapTable() {
       </tr>`;
     }
     return `<tr>
-      <td class="mono"><strong>#${slot.slot}</strong></td>
-      <td><strong>${slot.name}</strong></td>
-      <td class="mono">${slot.initialIndex}</td>
-      <td>${slot.probes > 0 ? `<span class="badge malware">+${slot.probes} geser</span>` : `<span class="badge clean">0 (Direct)</span>`}</td>
-      <td class="mono">${slot.shaFormatted}</td>
+      <td class="mono"><strong>#${escapeHtml(slot.slot)}</strong></td>
+      <td><strong>${escapeHtml(slot.name)}</strong></td>
+      <td class="mono">${escapeHtml(slot.initialIndex)}</td>
+      <td>${slot.probes > 0 ? `<span class="badge malware">+${escapeHtml(slot.probes)} geser</span>` : `<span class="badge clean">0 (Direct)</span>`}</td>
+      <td class="mono">${escapeHtml(slot.shaFormatted)}</td>
     </tr>`;
   }).join('');
 }
@@ -91,10 +102,18 @@ async function runScan() {
   const onlyExecutable = document.getElementById('chkExecOnly').checked;
 
   appendLog('\n--- Memulai dfsWalker() & Hashmap Lookup ---\n');
-  const res = await window.annaKav.scanTargets({
-    targetPaths: currentTargets,
-    onlyExecutable
-  });
+  let res;
+  try {
+    res = await window.annaKav.scanTargets({
+      targetPaths: currentTargets,
+      onlyExecutable
+    });
+  } catch (err) {
+    // Tanpa ini status tertahan di "SCANNING..." bila IPC gagal
+    document.getElementById('statStatus').textContent = 'ERROR';
+    appendLog(`[ERROR] Scan gagal: ${err.message}\n`);
+    return;
+  }
 
   document.getElementById('statTotal').textContent = res.totalScanned;
   document.getElementById('statMalware').textContent = res.detectedCount;
@@ -112,11 +131,11 @@ async function runScan() {
     if (r.status.startsWith('SKIPPED')) badgeClass = 'skip';
 
     return `<tr>
-      <td><strong>${r.fileName}</strong><br/><small style="color:#8b92a5">${r.filePath}</small></td>
-      <td>${r.size} B</td>
-      <td class="mono">${r.shaHex}</td>
-      <td>${r.matchedDb}</td>
-      <td><span class="badge ${badgeClass}">${r.status}</span></td>
+      <td><strong>${escapeHtml(r.fileName)}</strong><br/><small style="color:#8b92a5">${escapeHtml(r.filePath)}</small></td>
+      <td>${escapeHtml(r.size)} B</td>
+      <td class="mono">${escapeHtml(r.shaHex)}</td>
+      <td>${escapeHtml(r.matchedDb)}</td>
+      <td><span class="badge ${badgeClass}">${escapeHtml(r.status)}</span></td>
     </tr>`;
   }).join('');
 }
@@ -142,7 +161,7 @@ document.getElementById('btnRwGenerate').addEventListener('click', async () => {
     const out = await window.annaKav.createDbSignature({ sourceFilePath, outputDbName });
     const box = document.getElementById('rwResultBox');
     box.classList.remove('hidden');
-    box.innerHTML = `✅ Berhasil disimpan ke <strong>db/${out.fileName}</strong> (32 bytes)<br/>SHA-256: ${out.hexHash}`;
+    box.innerHTML = `✅ Berhasil disimpan ke <strong>db/${escapeHtml(out.fileName)}</strong> (32 bytes)<br/>SHA-256: ${escapeHtml(out.hexHash)}`;
     initApp();
   } catch (err) {
     alert('Gagal: ' + err.message);

@@ -2,7 +2,10 @@
 
 
 int main(){
-      hmload();
+      annaInitPaths(); //resolve db/, log.bin, scan root before any chdir()
+      if (hmload() == -1){
+            return 1;
+      }
       for (int j = 0 ; j < SL; j++){
             if (hashtable[j] != NULL){
                   printf("%d | sha of %s  = " , j, hashtable[j]->name);
@@ -19,4 +22,5 @@ int main(){
       WAFPrev();
       startWalking();
       Checkpoint();
+      return 0;
 }

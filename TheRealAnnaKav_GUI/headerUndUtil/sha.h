@@ -67,6 +67,12 @@ void WAFPrev();
 void Checkpoint();
 time_t readCheckpoint();
 
+//path config (chprelated.c) - env: ANNAKAV_DB, ANNAKAV_LOG, ANNAKAV_SCAN_ROOT
+void annaInitPaths();
+const char * annaDbDir();
+const char * annaLogPath();
+const char * annaScanRoot();
+
 void startWalking();
 
 

@@ -151,42 +151,98 @@ ipcMain.handle('annakav:selectTarget', async (_event, mode) => {
   return res.canceled ? [] : res.filePaths;
 });
 
+// Kirim log ke renderer dengan aman (window bisa saja sudah ditutup saat scan masih jalan)
+function sendLog(msg) {
+  if (mainWindow && !mainWindow.isDestroyed()) {
+    mainWindow.webContents.send('annakav:log', msg);
+  }
+}
+
+// Hash file secara streaming agar file besar (GB) tidak dimuat penuh ke RAM
+function sha256File(fpath) {
+  return new Promise((resolve, reject) => {
+    const hash = crypto.createHash('sha256');
+    const stream = fs.createReadStream(fpath);
+    stream.on('error', reject);
+    stream.on('data', chunk => hash.update(chunk));
+    stream.on('end', () => resolve(hash.digest()));
+  });
+}
+
+// Path relatif (mis. 'db' dari tombol "Test Scan Folder db/") di-resolve terhadap
+// folder proyek, bukan terhadap process.cwd() yang bisa berbeda-beda.
+function resolveTarget(p) {
+  return path.isAbsolute(p) ? p : path.resolve(PROJECT_ROOT, p);
+}
+
 // IPC: Run dfsWalker + HashAfile + Hashmap get()
-ipcMain.handle('annakav:scanTargets', async (_event, { targetPaths, onlyExecutable }) => {
+ipcMain.handle('annakav:scanTargets', async (_event, { targetPaths, onlyExecutable } = {}) => {
+  if (!Array.isArray(targetPaths) || targetPaths.length === 0) {
+    throw new Error('Tidak ada target scan.');
+  }
+
   const { hashtable, logs: hmLogs } = hmload();
-  hmLogs.forEach(l => mainWindow.webContents.send('annakav:log', l + '\n'));
+  hmLogs.forEach(l => sendLog(l + '\n'));
 
   const filesToScan = [];
-  function walk(currPath) {
-    if (!fs.existsSync(currPath)) return;
-    const st = fs.statSync(currPath);
+  let skippedCount = 0;
+
+  // dfsWalker async: error per entry (EACCES, EPERM, file hilang, dll) dicatat lalu dilewati,
+  // symlink/junction tidak diikuti (mencegah loop tak berhingga).
+  async function walk(currPath) {
+    let st;
+    try {
+      st = await fs.promises.lstat(currPath);
+    } catch (err) {
+      skippedCount++;
+      sendLog(`can't open ${currPath}: ${err.code || err.message}\n`);
+      return;
+    }
+
+    if (st.isSymbolicLink()) {
+      sendLog(`symlink dilewati : ${currPath}\n`);
+      return;
+    }
+
     if (st.isFile()) {
       filesToScan.push(currPath);
-    } else if (st.isDirectory()) {
-      mainWindow.webContents.send('annakav:log', `folder name : ${path.basename(currPath)}\n`);
-      const children = fs.readdirSync(currPath);
+      return;
+    }
+
+    if (st.isDirectory()) {
+      sendLog(`folder name : ${path.basename(currPath)}\n`);
+      let children;
+      try {
+        children = await fs.promises.readdir(currPath);
+      } catch (err) {
+        skippedCount++;
+        sendLog(`can't open folder ${currPath}: ${err.code || err.message}\n`);
+        return;
+      }
       for (const ch of children) {
         if (ch === '.' || ch === '..') continue;
-        walk(path.join(currPath, ch));
+        await walk(path.join(currPath, ch));
       }
     }
   }
 
-  targetPaths.forEach(walk);
+  for (const target of targetPaths) {
+    await walk(resolveTarget(String(target)));
+  }
 
   const results = [];
   for (const fpath of filesToScan) {
     try {
-      const st = fs.statSync(fpath);
+      const st = await fs.promises.stat(fpath);
       const fname = path.basename(fpath);
       const ext = path.extname(fname).toLowerCase();
       // In Windows, S_IEXEC or executable extensions (.exe, .bat, .cmd, .sh, .bin, .com)
       const isExec = Boolean((st.mode & 0o111) || ['.exe', '.bat', '.cmd', '.sh', '.bin', '.ps1', '.msi'].includes(ext));
 
-      mainWindow.webContents.send('annakav:log', `file name : ${fname}\n`);
+      sendLog(`file name : ${fname}\n`);
 
       if (onlyExecutable && !isExec) {
-        mainWindow.webContents.send('annakav:log', `${fname} is not executable\n`);
+        sendLog(`${fname} is not executable\n`);
         results.push({
           fileName: fname,
           filePath: fpath,
@@ -200,12 +256,13 @@ ipcMain.handle('annakav:scanTargets', async (_event, { targetPaths, onlyExecutab
         continue;
       }
 
-      const buf = fs.readFileSync(fpath);
-      const digest = crypto.createHash('sha256').update(buf).digest();
+      const digest = await sha256File(fpath);
       const shaBE = formatU32ArrayHex(sha256BufferToU32ArrayBE(digest));
       const shaLE = formatU32ArrayHex(bufferToU32ArrayLE(digest));
       // Check also if the file itself is an exact 32-byte raw hash signature file (like in db/)
-      const rawFileLE = buf.length === 32 ? formatU32ArrayHex(bufferToU32ArrayLE(buf)) : null;
+      const rawFileLE = st.size === 32
+        ? formatU32ArrayHex(bufferToU32ArrayLE(await fs.promises.readFile(fpath)))
+        : null;
 
       let matchedEntry = null;
       for (let slot = 0; slot < SL; slot++) {
@@ -223,7 +280,7 @@ ipcMain.handle('annakav:scanTargets', async (_event, { targetPaths, onlyExecutab
       }
 
       if (matchedEntry) {
-        mainWindow.webContents.send('annakav:log', `There is something here\nfile ${fname} is a ${matchedEntry.name}\n`);
+        sendLog(`There is something here\nfile ${fname} is a ${matchedEntry.name}\n`);
       }
 
       results.push({
@@ -237,20 +294,30 @@ ipcMain.handle('annakav:scanTargets', async (_event, { targetPaths, onlyExecutab
         matchedDb: matchedEntry ? `${matchedEntry.name} (Slot #${matchedEntry.slot})` : '-'
       });
     } catch (err) {
-      mainWindow.webContents.send('annakav:log', `Can't open ${fpath}: ${err.message}\n`);
+      skippedCount++;
+      sendLog(`Can't open ${fpath}: ${err.code || err.message}\n`);
     }
+  }
+
+  if (skippedCount > 0) {
+    sendLog(`[INFO] ${skippedCount} file/folder tidak bisa dibaca dan dilewati.\n`);
   }
 
   // Write Checkpoint (log.bin) after scanning, matching annakav.c -> Checkpoint()
   const nowSec = Math.floor(Date.now() / 1000);
-  const logBuf = Buffer.alloc(8);
-  logBuf.writeBigInt64LE(BigInt(nowSec), 0);
-  fs.writeFileSync(LOG_BIN_PATH, logBuf);
-  mainWindow.webContents.send('annakav:log', `[Checkpoint] log.bin diperbarui pada epoch ${nowSec}\n`);
+  try {
+    const logBuf = Buffer.alloc(8);
+    logBuf.writeBigInt64LE(BigInt(nowSec), 0);
+    await fs.promises.writeFile(LOG_BIN_PATH, logBuf);
+    sendLog(`[Checkpoint] log.bin diperbarui pada epoch ${nowSec}\n`);
+  } catch (err) {
+    sendLog(`[Checkpoint] Gagal menulis log.bin: ${err.message}\n`);
+  }
 
   return {
     totalScanned: results.length,
     detectedCount: results.filter(r => r.status === 'MALWARE DETECTED').length,
+    skippedCount,
     checkpointEpoch: nowSec,
     results
   };
@@ -278,7 +345,7 @@ ipcMain.handle('annakav:createDbSignature', async (_event, { sourceFilePath, out
   const destPath = path.join(DB_DIR, cleanName);
   fs.writeFileSync(destPath, outBuf);
   const hexOut = formatU32ArrayHex(u32BE);
-  mainWindow.webContents.send('annakav:log', `[readwritedb] ${cleanName} ditulis ke db/ -> ${hexOut}\n`);
+  sendLog(`[readwritedb] ${cleanName} ditulis ke db/ -> ${hexOut}\n`);
 
   return {
     fileName: cleanName,

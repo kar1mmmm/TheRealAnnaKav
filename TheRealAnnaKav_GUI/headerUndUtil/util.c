@@ -101,7 +101,12 @@ int dfsWalker(char *path){
 
 
 void startWalking(){
-      chdir("/home/draco/");
+      const char *root = annaScanRoot(); //configurable (ANNAKAV_SCAN_ROOT, default $HOME)
+      if (chdir(root) == -1){
+            fprintf(stderr, "startWalking: can't chdir to %s: ", root);
+            perror(NULL);
+            return;
+      }
       dfsWalker("./");
 }
 

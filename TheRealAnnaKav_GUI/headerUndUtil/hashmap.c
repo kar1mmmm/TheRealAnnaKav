@@ -30,6 +30,7 @@ void insertToHm(u32t * sha, char *name){
 
       if (counter == SL){
             printf("ALERT:HASHMAP IS FULL\n");
+            free(data->name);
             free(data);
             goto end;
       }
@@ -44,11 +45,11 @@ void insertToHm(u32t * sha, char *name){
 
       hashtable[index] = data;
 
-      end:
+      end: ; //empty statement: a label right before '}' is an error before C23
 }
 
 hashed * get(u32t * sha){
-      hashed * target = malloc(sizeof(hashed));
+      hashed * target = NULL; //was malloc'd then overwritten -> leaked on every lookup
       uint t = Ihash(sha) % SL;
       uint count = 0;
       //verify
@@ -87,8 +88,18 @@ int hmload(){
 
       DIR *dir;
       struct dirent *entry;
-      dir = opendir("/home/draco/vode/AnnaKav/db/");
-      chdir("/home/draco/vode/AnnaKav/db/");
+      const char *db = annaDbDir(); //configurable, see chprelated.c (ANNAKAV_DB)
+      dir = opendir(db);
+      if (dir == NULL){
+            fprintf(stderr, "hmload: can't open db directory %s: ", db);
+            perror(NULL);
+            return -1;
+      }
+      if (chdir(db) == -1){
+            perror("hmload: chdir to db directory failed");
+            closedir(dir);
+            return -1;
+      }
 
       while(entry = readdir(dir)){
             if (strcmp(entry->d_name, ".") == 0 || strcmp(entry->d_name, "..") == 0){
@@ -98,13 +109,24 @@ int hmload(){
 
             int Fp = open(entry->d_name, O_RDONLY);
             if (Fp == -1 ){
-                  printf("ERROR");
+                  printf("ERROR: can't open %s\n", entry->d_name);
+                  continue;
             }
 
-            ssize_t n = read(Fp, &shafile[0], sizeof(u32t));
-            uint i = 1;
-            while (n > 0){
-                  n = read(Fp, &shafile[i++],sizeof(u32t));
+            //fix: read exactly 8 words (32 bytes). The old loop kept reading
+            //until EOF and wrote past shafile[7] for files bigger than 32 bytes.
+            unsigned char *dst = (unsigned char *)shafile;
+            size_t got = 0;
+            while (got < sizeof(shafile)){
+                  ssize_t n = read(Fp, dst + got, sizeof(shafile) - got);
+                  if (n <= 0) break;
+                  got += (size_t)n;
+            }
+
+            if (got != sizeof(shafile)){
+                  printf("WARNING: %s is not a valid 32 byte signature, skipped\n", entry->d_name);
+                  close(Fp);
+                  continue;
             }
 
             insertToHm(shafile, entry->d_name);
@@ -139,4 +161,5 @@ int hmload(){
       }
       */
       closedir(dir);
+      return 0;
 }
