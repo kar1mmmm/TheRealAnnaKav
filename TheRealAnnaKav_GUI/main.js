@@ -7,12 +7,14 @@ let mainWindow;
 const PROJECT_ROOT = __dirname;
 const DB_DIR = path.join(PROJECT_ROOT, 'db');
 const LOG_BIN_PATH = path.join(PROJECT_ROOT, 'log.bin');
-const SL = 10; // Hashmap size from sha.h (#define SL 10)
+const QUARANTINE_DIR = path.join(PROJECT_ROOT, 'quarantine');
+const QUARANTINE_MANIFEST = path.join(QUARANTINE_DIR, 'manifest.json');
+const INITIAL_SL = 16; // v0.1.5 Dynamic Hashmap initial capacity (sha.h #define SL 16)
 
 function createWindow() {
   mainWindow = new BrowserWindow({
-    width: 1220,
-    height: 800,
+    width: 1240,
+    height: 820,
     minWidth: 980,
     minHeight: 650,
     backgroundColor: '#111216',
@@ -34,7 +36,8 @@ app.on('window-all-closed', () => {
 });
 
 // ============================================================================
-// EXACT C ENGINE IMPLEMENTATION (sha.c, hashmap.c, util.c, readwritedb.c, chprelated.c)
+// EXACT C ENGINE IMPLEMENTATION v0.1.5
+// (Dynamic Hashmap, O(1) Ihash Lookup, Incremental Checkpoint, Quarantine)
 // ============================================================================
 
 // From hashmap.c: uint Ihash(u32t * sha)
@@ -73,14 +76,73 @@ function formatU32ArrayHex(arr) {
   return Array.from(arr).map(v => (v >>> 0).toString(16).padStart(8, '0')).join('');
 }
 
-// Load Hashmap from db/ directory (exact replica of hmload() in hashmap.c)
+// O(1) Hashmap get() replica from hashmap.c (linear probing from Ihash(sha) % cap)
+function hmGet(hashtable, shaU32) {
+  const cap = hashtable.length;
+  if (!cap) return null;
+  let t = Ihash(shaU32) % cap;
+  let count = 0;
+
+  while (count < cap && hashtable[t] !== null) {
+    const entry = hashtable[t];
+    let match = true;
+    for (let i = 0; i < 8; i++) {
+      if ((entry.shaU32[i] >>> 0) !== (shaU32[i] >>> 0)) {
+        match = false;
+        break;
+      }
+    }
+    if (match) return entry;
+    t = (t + 1) % cap;
+    count++;
+  }
+  return null;
+}
+
+// Load Dynamic Hashmap from db/ directory (v0.1.5 replica of hmload() with 2x resize at 70% load)
 function hmload() {
-  const hashtable = new Array(SL).fill(null);
+  let capacity = INITIAL_SL;
+  let hashtable = new Array(capacity).fill(null);
+  let count = 0;
   const logs = [];
 
   if (!fs.existsSync(DB_DIR)) {
     logs.push('[ERROR] Folder db/ tidak ditemukan: ' + DB_DIR);
-    return { hashtable, logs };
+    return { hashtable, capacity, count, logs };
+  }
+
+  function placeItem(table, cap, item) {
+    let idx = Ihash(item.shaU32) % cap;
+    let probes = 0;
+    while (probes < cap) {
+      if (table[idx] === null) {
+        table[idx] = {
+          ...item,
+          slot: idx,
+          initialIndex: Ihash(item.shaU32) % cap,
+          probes
+        };
+        return true;
+      }
+      idx = (idx + 1) % cap;
+      probes++;
+    }
+    return false;
+  }
+
+  function resizeHm(newCap) {
+    const oldTable = hashtable;
+    const oldCap = capacity;
+    hashtable = new Array(newCap).fill(null);
+    capacity = newCap;
+    count = 0;
+    for (let i = 0; i < oldCap; i++) {
+      if (oldTable[i] !== null) {
+        placeItem(hashtable, capacity, oldTable[i]);
+        count++;
+      }
+    }
+    logs.push(`[Hashmap] Resized capacity ${oldCap} -> ${capacity}`);
   }
 
   const entries = fs.readdirSync(DB_DIR);
@@ -91,41 +153,34 @@ function hmload() {
     if (!stat.isFile()) continue;
 
     const rawBuf = fs.readFileSync(fullPath);
-    if (rawBuf.length < 32) continue;
+    if (rawBuf.length !== 32) {
+      logs.push(`WARNING: ${name} bukan signature 32-byte (${rawBuf.length} B), dilewati`);
+      continue;
+    }
+
+    if ((count + 1) * 10 >= capacity * 7) {
+      resizeHm(capacity * 2);
+    }
 
     const shafile = bufferToU32ArrayLE(rawBuf);
     const rawHexBE = rawBuf.subarray(0, 32).toString('hex');
 
-    // insertToHm(shafile, entry->d_name)
-    let index = Ihash(shafile) % SL;
-    let counter = 0;
-    let placed = false;
+    const placed = placeItem(hashtable, capacity, {
+      name,
+      shaU32: Array.from(shafile),
+      shaFormatted: formatU32ArrayHex(shafile),
+      rawHex: rawHexBE,
+      size: rawBuf.length
+    });
 
-    while (counter < SL) {
-      if (hashtable[index] === null) {
-        hashtable[index] = {
-          slot: index,
-          name: name,
-          shaU32: Array.from(shafile),
-          shaFormatted: formatU32ArrayHex(shafile),
-          rawHex: rawHexBE,
-          initialIndex: Ihash(shafile) % SL,
-          probes: counter,
-          size: rawBuf.length
-        };
-        placed = true;
-        break;
-      }
-      index = (index + 1) % SL;
-      counter++;
-    }
-
-    if (!placed) {
+    if (placed) {
+      count++;
+    } else {
       logs.push('ALERT:HASHMAP IS FULL (ketika memasukkan ' + name + ')');
     }
   }
 
-  for (let j = 0; j < SL; j++) {
+  for (let j = 0; j < capacity; j++) {
     if (hashtable[j] !== null) {
       logs.push(`${j} | sha of ${hashtable[j].name}  = ${hashtable[j].shaFormatted}`);
     } else {
@@ -133,7 +188,39 @@ function hmload() {
     }
   }
 
-  return { hashtable, logs };
+  return { hashtable, capacity, count, logs };
+}
+
+function readCheckpointEpoch() {
+  if (!fs.existsSync(LOG_BIN_PATH)) return null;
+  try {
+    const b = fs.readFileSync(LOG_BIN_PATH);
+    if (b.length >= 8) return Number(b.readBigInt64LE(0));
+    if (b.length >= 4) return b.readUInt32LE(0);
+  } catch (_) {}
+  return null;
+}
+
+// Kirim log ke renderer dengan aman
+function sendLog(msg) {
+  if (mainWindow && !mainWindow.isDestroyed()) {
+    mainWindow.webContents.send('annakav:log', msg);
+  }
+}
+
+// Hash file secara streaming agar file besar tidak dimuat penuh ke RAM
+function sha256File(fpath) {
+  return new Promise((resolve, reject) => {
+    const hash = crypto.createHash('sha256');
+    const stream = fs.createReadStream(fpath);
+    stream.on('error', reject);
+    stream.on('data', chunk => hash.update(chunk));
+    stream.on('end', () => resolve(hash.digest()));
+  });
+}
+
+function resolveTarget(p) {
+  return path.isAbsolute(p) ? p : path.resolve(PROJECT_ROOT, p);
 }
 
 // IPC: Get Hashmap & DB State
@@ -151,32 +238,8 @@ ipcMain.handle('annakav:selectTarget', async (_event, mode) => {
   return res.canceled ? [] : res.filePaths;
 });
 
-// Kirim log ke renderer dengan aman (window bisa saja sudah ditutup saat scan masih jalan)
-function sendLog(msg) {
-  if (mainWindow && !mainWindow.isDestroyed()) {
-    mainWindow.webContents.send('annakav:log', msg);
-  }
-}
-
-// Hash file secara streaming agar file besar (GB) tidak dimuat penuh ke RAM
-function sha256File(fpath) {
-  return new Promise((resolve, reject) => {
-    const hash = crypto.createHash('sha256');
-    const stream = fs.createReadStream(fpath);
-    stream.on('error', reject);
-    stream.on('data', chunk => hash.update(chunk));
-    stream.on('end', () => resolve(hash.digest()));
-  });
-}
-
-// Path relatif (mis. 'db' dari tombol "Test Scan Folder db/") di-resolve terhadap
-// folder proyek, bukan terhadap process.cwd() yang bisa berbeda-beda.
-function resolveTarget(p) {
-  return path.isAbsolute(p) ? p : path.resolve(PROJECT_ROOT, p);
-}
-
-// IPC: Run dfsWalker + HashAfile + Hashmap get()
-ipcMain.handle('annakav:scanTargets', async (_event, { targetPaths, onlyExecutable } = {}) => {
+// IPC: Run dfsWalker + HashAfile + O(1) Hashmap get() + Incremental Checkpoint
+ipcMain.handle('annakav:scanTargets', async (_event, { targetPaths, onlyExecutable, incrementalCheckpoint } = {}) => {
   if (!Array.isArray(targetPaths) || targetPaths.length === 0) {
     throw new Error('Tidak ada target scan.');
   }
@@ -184,11 +247,14 @@ ipcMain.handle('annakav:scanTargets', async (_event, { targetPaths, onlyExecutab
   const { hashtable, logs: hmLogs } = hmload();
   hmLogs.forEach(l => sendLog(l + '\n'));
 
+  const lastCheckpoint = incrementalCheckpoint ? (readCheckpointEpoch() || 0) : 0;
+  if (incrementalCheckpoint && lastCheckpoint > 0) {
+    sendLog(`[Checkpoint] Mode Incremental aktif (hanya file yang berubah setelah epoch ${lastCheckpoint})\n`);
+  }
+
   const filesToScan = [];
   let skippedCount = 0;
 
-  // dfsWalker async: error per entry (EACCES, EPERM, file hilang, dll) dicatat lalu dilewati,
-  // symlink/junction tidak diikuti (mencegah loop tak berhingga).
   async function walk(currPath) {
     let st;
     try {
@@ -210,6 +276,8 @@ ipcMain.handle('annakav:scanTargets', async (_event, { targetPaths, onlyExecutab
     }
 
     if (st.isDirectory()) {
+      // Jangan memindai ulang isi folder quarantine
+      if (path.resolve(currPath) === path.resolve(QUARANTINE_DIR)) return;
       sendLog(`folder name : ${path.basename(currPath)}\n`);
       let children;
       try {
@@ -236,7 +304,6 @@ ipcMain.handle('annakav:scanTargets', async (_event, { targetPaths, onlyExecutab
       const st = await fs.promises.stat(fpath);
       const fname = path.basename(fpath);
       const ext = path.extname(fname).toLowerCase();
-      // In Windows, S_IEXEC or executable extensions (.exe, .bat, .cmd, .sh, .bin, .com)
       const isExec = Boolean((st.mode & 0o111) || ['.exe', '.bat', '.cmd', '.sh', '.bin', '.ps1', '.msi'].includes(ext));
 
       sendLog(`file name : ${fname}\n`);
@@ -256,27 +323,34 @@ ipcMain.handle('annakav:scanTargets', async (_event, { targetPaths, onlyExecutab
         continue;
       }
 
-      const digest = await sha256File(fpath);
-      const shaBE = formatU32ArrayHex(sha256BufferToU32ArrayBE(digest));
-      const shaLE = formatU32ArrayHex(bufferToU32ArrayLE(digest));
-      // Check also if the file itself is an exact 32-byte raw hash signature file (like in db/)
-      const rawFileLE = st.size === 32
-        ? formatU32ArrayHex(bufferToU32ArrayLE(await fs.promises.readFile(fpath)))
-        : null;
+      const fileMtimeSec = Math.floor(st.mtimeMs / 1000);
+      if (incrementalCheckpoint && lastCheckpoint > 0 && fileMtimeSec <= lastCheckpoint) {
+        sendLog(`${fname} unchanged since checkpoint (${lastCheckpoint}), skipped\n`);
+        results.push({
+          fileName: fname,
+          filePath: fpath,
+          size: st.size,
+          mtime: st.mtimeMs,
+          isExecutable: isExec,
+          shaHex: '-',
+          status: 'SKIPPED (Unchanged)',
+          matchedDb: '-'
+        });
+        continue;
+      }
 
-      let matchedEntry = null;
-      for (let slot = 0; slot < SL; slot++) {
-        const item = hashtable[slot];
-        if (!item) continue;
-        if (
-          item.shaFormatted === shaBE ||
-          item.shaFormatted === shaLE ||
-          item.rawHex === shaBE ||
-          (rawFileLE && item.shaFormatted === rawFileLE)
-        ) {
-          matchedEntry = item;
-          break;
-        }
+      const digest = await sha256File(fpath);
+      const u32BE = sha256BufferToU32ArrayBE(digest);
+      const u32LE = bufferToU32ArrayLE(digest);
+      const shaBE = formatU32ArrayHex(u32BE);
+
+      // O(1) Hashmap lookup using hmGet (matching get() in hashmap.c)
+      let matchedEntry = hmGet(hashtable, u32BE) || hmGet(hashtable, u32LE);
+
+      // Support testing directly against raw 32-byte signature files inside db/
+      if (!matchedEntry && st.size === 32) {
+        const rawU32 = bufferToU32ArrayLE(await fs.promises.readFile(fpath));
+        matchedEntry = hmGet(hashtable, rawU32);
       }
 
       if (matchedEntry) {
@@ -303,7 +377,6 @@ ipcMain.handle('annakav:scanTargets', async (_event, { targetPaths, onlyExecutab
     sendLog(`[INFO] ${skippedCount} file/folder tidak bisa dibaca dan dilewati.\n`);
   }
 
-  // Write Checkpoint (log.bin) after scanning, matching annakav.c -> Checkpoint()
   const nowSec = Math.floor(Date.now() / 1000);
   try {
     const logBuf = Buffer.alloc(8);
@@ -323,19 +396,148 @@ ipcMain.handle('annakav:scanTargets', async (_event, { targetPaths, onlyExecutab
   };
 });
 
+// ============================================================================
+// v0.1.5: QUARANTINE MANAGEMENT (Quarantine, List, Restore, Delete)
+// ============================================================================
+
+function loadQuarantineManifest() {
+  if (!fs.existsSync(QUARANTINE_MANIFEST)) return [];
+  try {
+    const data = JSON.parse(fs.readFileSync(QUARANTINE_MANIFEST, 'utf8'));
+    return Array.isArray(data) ? data : [];
+  } catch (_) {
+    return [];
+  }
+}
+
+function saveQuarantineManifest(items) {
+  if (!fs.existsSync(QUARANTINE_DIR)) {
+    fs.mkdirSync(QUARANTINE_DIR, { recursive: true });
+  }
+  fs.writeFileSync(QUARANTINE_MANIFEST, JSON.stringify(items, null, 2), 'utf8');
+}
+
+// Pindahkan file secara aman termasuk lintas partisi/drive (mis. C: -> D: menimbulkan EXDEV pada rename)
+async function moveFileSafe(srcPath, destPath) {
+  try { await fs.promises.chmod(srcPath, 0o666); } catch (_) {}
+  try {
+    await fs.promises.rename(srcPath, destPath);
+  } catch (err) {
+    if (err.code === 'EXDEV') {
+      await fs.promises.copyFile(srcPath, destPath);
+      await fs.promises.unlink(srcPath);
+    } else {
+      throw err;
+    }
+  }
+}
+
+ipcMain.handle('annakav:getQuarantineList', async () => {
+  const list = loadQuarantineManifest();
+  return list.filter(item => fs.existsSync(path.join(QUARANTINE_DIR, item.quarantinedName)));
+});
+
+ipcMain.handle('annakav:quarantineFile', async (_event, { filePath, matchedDb, shaHex } = {}) => {
+  if (!filePath || !fs.existsSync(filePath)) {
+    throw new Error('File tidak ditemukan atau sudah dipindahkan.');
+  }
+  // Cegah mengkarantina file signature bawaan di dalam folder db/
+  if (path.resolve(path.dirname(filePath)) === path.resolve(DB_DIR)) {
+    throw new Error('File di dalam folder signature db/ tidak boleh dikarantina.');
+  }
+
+  if (!fs.existsSync(QUARANTINE_DIR)) {
+    fs.mkdirSync(QUARANTINE_DIR, { recursive: true });
+  }
+
+  const st = fs.statSync(filePath);
+  const id = `${Date.now()}_${crypto.randomBytes(3).toString('hex')}`;
+  const baseName = path.basename(filePath);
+  const quarantinedName = `${id}_${baseName}.quarantined`;
+  const destPath = path.join(QUARANTINE_DIR, quarantinedName);
+
+  await moveFileSafe(filePath, destPath);
+  try {
+    await fs.promises.chmod(destPath, 0o400);
+  } catch (_) {}
+
+  const manifest = loadQuarantineManifest();
+  const entry = {
+    id,
+    originalName: baseName,
+    originalPath: path.resolve(filePath),
+    originalMode: st.mode & 0o777,
+    quarantinedName,
+    matchedDb: matchedDb || '-',
+    shaHex: shaHex || '-',
+    size: st.size,
+    quarantinedAt: Date.now()
+  };
+  manifest.unshift(entry);
+  saveQuarantineManifest(manifest);
+
+  sendLog(`[QUARANTINE] ${filePath} dipindahkan ke quarantine/${quarantinedName}\n`);
+  return entry;
+});
+
+ipcMain.handle('annakav:restoreQuarantine', async (_event, id) => {
+  const manifest = loadQuarantineManifest();
+  const idx = manifest.findIndex(x => x.id === id);
+  if (idx === -1) throw new Error('Data karantina tidak ditemukan.');
+
+  const item = manifest[idx];
+  const qPath = path.join(QUARANTINE_DIR, item.quarantinedName);
+  if (!fs.existsSync(qPath)) {
+    manifest.splice(idx, 1);
+    saveQuarantineManifest(manifest);
+    throw new Error('File fisik di karantina sudah tidak ada.');
+  }
+
+  const parentDir = path.dirname(item.originalPath);
+  if (!fs.existsSync(parentDir)) {
+    fs.mkdirSync(parentDir, { recursive: true });
+  }
+
+  await moveFileSafe(qPath, item.originalPath);
+  if (item.originalMode) {
+    try { await fs.promises.chmod(item.originalPath, item.originalMode); } catch (_) {}
+  }
+
+  manifest.splice(idx, 1);
+  saveQuarantineManifest(manifest);
+  sendLog(`[QUARANTINE] Dipulihkan: ${item.originalPath}\n`);
+  return item;
+});
+
+ipcMain.handle('annakav:deleteQuarantine', async (_event, id) => {
+  const manifest = loadQuarantineManifest();
+  const idx = manifest.findIndex(x => x.id === id);
+  if (idx === -1) throw new Error('Data karantina tidak ditemukan.');
+
+  const item = manifest[idx];
+  const qPath = path.join(QUARANTINE_DIR, item.quarantinedName);
+  if (fs.existsSync(qPath)) {
+    try { await fs.promises.chmod(qPath, 0o666); } catch (_) {}
+    await fs.promises.unlink(qPath);
+  }
+
+  manifest.splice(idx, 1);
+  saveQuarantineManifest(manifest);
+  sendLog(`[QUARANTINE] Dihapus permanen: ${item.originalName}\n`);
+  return item;
+});
+
 // IPC: readwritedb.c tool — Hash a file and save 32-byte binary signature into db/
 ipcMain.handle('annakav:createDbSignature', async (_event, { sourceFilePath, outputDbName }) => {
   if (!fs.existsSync(sourceFilePath)) {
     throw new Error('File sumber tidak ditemukan.');
   }
-  const cleanName = path.basename(outputDbName.trim());
-  if (!cleanName) {
-    throw new Error('Nama file DB output tidak boleh kosong.');
+  const cleanName = path.basename(String(outputDbName || '').trim());
+  if (!cleanName || cleanName === '.' || cleanName === '..') {
+    throw new Error('Nama file DB output tidak valid.');
   }
 
-  const buf = fs.readFileSync(sourceFilePath);
-  const digest = crypto.createHash('sha256').update(buf).digest();
-  // In readwritedb.c: u32t * H = HashAfile(argv[1]); fwrite(HforDB, sizeof(u32t), 8, binWRITE);
+  const digest = await sha256File(sourceFilePath);
   const u32BE = sha256BufferToU32ArrayBE(digest);
   const outBuf = Buffer.alloc(32);
   for (let i = 0; i < 8; i++) {
@@ -356,26 +558,26 @@ ipcMain.handle('annakav:createDbSignature', async (_event, { sourceFilePath, out
 
 // IPC: WAFPrev() & Checkpoint() status
 ipcMain.handle('annakav:getSecurityStatus', async () => {
-  let checkpointTime = null;
-  if (fs.existsSync(LOG_BIN_PATH)) {
-    const b = fs.readFileSync(LOG_BIN_PATH);
-    if (b.length >= 8) {
-      checkpointTime = Number(b.readBigInt64LE(0));
-    } else if (b.length >= 4) {
-      checkpointTime = b.readUInt32LE(0);
-    }
-  }
+  const checkpointTime = readCheckpointEpoch();
 
   const isLinux = process.platform === 'linux';
-  let passwdMode = '0644 (Simulated on Windows / Compliant)';
-  let shadowMode = '0600 (Simulated on Windows / Compliant)';
+  let passwdMode = 'N/A (Khusus Linux — berjalan di ' + process.platform + ')';
+  let shadowMode = 'N/A (Khusus Linux — berjalan di ' + process.platform + ')';
   if (isLinux) {
     try {
       const stP = fs.statSync('/etc/passwd');
-      passwdMode = '0' + (stP.mode & 0o777).toString(8);
+      const mP = stP.mode & 0o777;
+      passwdMode = `0${mP.toString(8)} (${(mP & 0o022) ? 'ALERT: Weak Permission!' : 'Compliant'})`;
+    } catch (e) {
+      passwdMode = `Error: ${e.code || e.message}`;
+    }
+    try {
       const stS = fs.statSync('/etc/shadow');
-      shadowMode = '0' + (stS.mode & 0o777).toString(8);
-    } catch (_) {}
+      const mS = stS.mode & 0o777;
+      shadowMode = `0${mS.toString(8)} (${(mS & 0o077) ? 'ALERT: Weak Permission!' : 'Compliant'})`;
+    } catch (e) {
+      shadowMode = `Error: ${e.code || e.message}`;
+    }
   }
 
   return {

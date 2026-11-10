@@ -1,11 +1,12 @@
 #include "sha.h"
 #include <dirent.h>
 #include <string.h>
-hashed *hashtable[SL];
-//This index hashing value is a homework for me 
-//It wasn't the most effective one 
-//Effective In context of what?
-//i don't know
+
+// v0.1.5: Dynamic Hashmap with automatic 2x resizing at 70% load factor
+hashed **hashtable = NULL;
+uint hmCapacity = SL;
+uint hmCount = 0;
+
 uint Ihash(u32t * sha){
       uint hashval = 0;
       for (int i = 0; i < 8; i++){
@@ -14,11 +15,53 @@ uint Ihash(u32t * sha){
       return hashval;
 }
 
+static void initHmTable(uint cap){
+      if (hashtable == NULL){
+            hmCapacity = cap > 0 ? cap : SL;
+            hashtable = calloc(hmCapacity, sizeof(hashed *));
+            hmCount = 0;
+      }
+}
+
+static void resizeHm(uint newCap){
+      hashed **oldTable = hashtable;
+      uint oldCap = hmCapacity;
+
+      hashtable = calloc(newCap, sizeof(hashed *));
+      if (hashtable == NULL){
+            hashtable = oldTable;
+            return;
+      }
+      hmCapacity = newCap;
+      hmCount = 0;
+
+      for (uint i = 0; i < oldCap; i++){
+            if (oldTable[i] != NULL){
+                  uint idx = Ihash(oldTable[i]->sha) % hmCapacity;
+                  while (hashtable[idx] != NULL){
+                        idx = (idx + 1) % hmCapacity;
+                  }
+                  hashtable[idx] = oldTable[i];
+                  hmCount++;
+            }
+      }
+      free(oldTable);
+      printf("[Hashmap] Resized capacity %u -> %u\n", oldCap, hmCapacity);
+}
+
 
 void insertToHm(u32t * sha, char *name){
+      initHmTable(SL);
+
+      // Resize 2x before load factor exceeds 70%
+      if ((hmCount + 1) * 10 >= hmCapacity * 7){
+            resizeHm(hmCapacity * 2);
+      }
+
       hashed * data = malloc(sizeof(hashed));
-      uint index,counter;
-      index = Ihash(sha) % SL;
+      if (data == NULL) return;
+      uint index, counter;
+      index = Ihash(sha) % hmCapacity;
       counter = 0;
       data->name = strdup(name);
 
@@ -28,15 +71,15 @@ void insertToHm(u32t * sha, char *name){
 
       check:
 
-      if (counter == SL){
+      if (counter == hmCapacity){
             printf("ALERT:HASHMAP IS FULL\n");
             free(data->name);
             free(data);
             goto end;
       }
       if (hashtable[index] != NULL){
-            index+= 1;
-            if (index >= SL){
+            index += 1;
+            if (index >= hmCapacity){
                   index = 0;
             }
             counter += 1;
@@ -44,35 +87,33 @@ void insertToHm(u32t * sha, char *name){
       }
 
       hashtable[index] = data;
+      hmCount++;
 
       end: ; //empty statement: a label right before '}' is an error before C23
 }
 
 hashed * get(u32t * sha){
-      hashed * target = NULL; //was malloc'd then overwritten -> leaked on every lookup
-      uint t = Ihash(sha) % SL;
+      if (hashtable == NULL || hmCapacity == 0) return NULL;
+      hashed * target = NULL;
+      uint t = Ihash(sha) % hmCapacity;
       uint count = 0;
-      //verify
-      while(count < SL ){
-            if (hashtable[t] != NULL){
-                  int x =0;
-                  for (int i = 0; i < 8; i++ ){
-                        if(sha[i] != hashtable[t]->sha[i]){
-                              break;
-                        }
-                        else{
-                              x++;
-                        }
+      //verify (stop early if we hit an empty slot during linear probing)
+      while(count < hmCapacity && hashtable[t] != NULL){
+            int x = 0;
+            for (int i = 0; i < 8; i++ ){
+                  if(sha[i] != hashtable[t]->sha[i]){
+                        break;
                   }
-
-                  if (x==8){
-                        target = hashtable[t];
-                        return target;
+                  else{
+                        x++;
                   }
             }
-            t++;
 
-            if (t >= SL) t = 0;
+            if (x == 8){
+                  target = hashtable[t];
+                  return target;
+            }
+            t = (t + 1) % hmCapacity;
             count++;
       }
 
@@ -80,11 +121,21 @@ hashed * get(u32t * sha){
       return NULL;
 }
 
-//named this main function to hmload later
-//At the end of any coding session, i think it's a must for me to recap what've i done. (2026-10-15)
 int hmload(){
       u32t shafile[8];
-      u32t new[8];
+
+      // Reset table if reloading
+      if (hashtable != NULL){
+            for (uint j = 0; j < hmCapacity; j++){
+                  if (hashtable[j] != NULL){
+                        free(hashtable[j]->name);
+                        free(hashtable[j]);
+                  }
+            }
+            free(hashtable);
+            hashtable = NULL;
+      }
+      initHmTable(SL);
 
       DIR *dir;
       struct dirent *entry;
@@ -101,7 +152,7 @@ int hmload(){
             return -1;
       }
 
-      while(entry = readdir(dir)){
+      while((entry = readdir(dir)) != NULL){
             if (strcmp(entry->d_name, ".") == 0 || strcmp(entry->d_name, "..") == 0){
                   continue;
             }
@@ -113,8 +164,7 @@ int hmload(){
                   continue;
             }
 
-            //fix: read exactly 8 words (32 bytes). The old loop kept reading
-            //until EOF and wrote past shafile[7] for files bigger than 32 bytes.
+            //fix: read exactly 8 words (32 bytes).
             unsigned char *dst = (unsigned char *)shafile;
             size_t got = 0;
             while (got < sizeof(shafile)){
@@ -133,33 +183,6 @@ int hmload(){
             close(Fp);
       }
 
-      for (int j = 0 ; j < SL; j++){
-            if (hashtable[j] != NULL){
-                  printf("%d | sha of %s  = " , j, hashtable[j]->name);
-                  for (int i = 0; i < 8; i++ ){
-                        printf("%08x", hashtable[j]->sha[i]);
-                  }
-            }
-
-            else{
-                  printf("%d | UNALLOCATED", j);
-            }
-            printf("\n");
-      }
-
-      /*
-      hashed * data = get(new);
-      if (data != NULL){
-            for (int i = 0 ; i < 8; i++){
-                  printf("%08x", data->sha[i]);
-            }
-            printf("\n");
-      }
-
-      else{
-            printf("Item doesn't exist in hashmap\n");
-      }
-      */
       closedir(dir);
       return 0;
 }

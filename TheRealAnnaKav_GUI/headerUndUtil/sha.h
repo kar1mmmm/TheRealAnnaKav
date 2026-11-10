@@ -6,21 +6,23 @@
 #include <sys/stat.h>
 #include <unistd.h>
 #include <fcntl.h>
-#include <stddef.h>
-#include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
 #include <stdio.h>
+#include <time.h>
 
 typedef uint64_t u64t;
 typedef uint32_t u32t;
+typedef unsigned int uint;
+
 typedef struct{
       u32t sha[8];
       char * name;
 }hashed;
 
+// v0.1.5: Dynamic Hashmap default initial capacity (grows 2x when load >= 70%)
 #ifndef SL
-#define SL 10
+#define SL 16
 #endif // !SL
 
 
@@ -61,17 +63,20 @@ u32t * MultiSha (unsigned char * hasi, u32t * H, size_t len, u64t fs);
 u32t * HashAfile(char * path);
 u32t * HashAfileByFp(int Pp, struct stat *file );
 int  dfsWalker(char *path);
-short LinearComparison(u32t * fileHashed);
 
 void WAFPrev();
 void Checkpoint();
 time_t readCheckpoint();
 
-//path config (chprelated.c) - env: ANNAKAV_DB, ANNAKAV_LOG, ANNAKAV_SCAN_ROOT
+//path config (chprelated.c) - env: ANNAKAV_DB, ANNAKAV_LOG, ANNAKAV_SCAN_ROOT, ANNAKAV_QUARANTINE
 void annaInitPaths();
 const char * annaDbDir();
 const char * annaLogPath();
 const char * annaScanRoot();
+const char * annaQuarantineDir();
+
+//v0.1.5: Quarantine action for detected malware
+int quarantineFile(const char *filepath, const char *sigName);
 
 void startWalking();
 
@@ -80,7 +85,9 @@ int hmload();
 hashed * get(u32t * sha);
 void insertToHm(u32t * sha, char *name);
 uint Ihash(u32t * sha);
-extern hashed * hashtable[SL] ;
+extern hashed ** hashtable;
+extern uint hmCapacity;
+extern uint hmCount;
 
 
 #endif // !SHA

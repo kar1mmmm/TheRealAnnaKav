@@ -6,16 +6,15 @@
 #define PATH_MAX 4096
 #endif
 
-//Path configuration (v0.1.4 fix: no more hardcoded /home/draco/... paths)
-//Every path is resolved ONCE to an absolute path, before anything calls chdir(),
-//so hmload()/dfsWalker() changing the cwd can't break them anymore.
-//
+//Path configuration (v0.1.5: includes ANNAKAV_QUARANTINE folder)
 //  ANNAKAV_DB         -> signature folder   (default: <start dir>/db/)
 //  ANNAKAV_LOG        -> checkpoint file    (default: <start dir>/log.bin)
 //  ANNAKAV_SCAN_ROOT  -> folder to walk     (default: $HOME, or / if unset)
+//  ANNAKAV_QUARANTINE -> quarantine folder  (default: <start dir>/quarantine)
 static char dbDir[PATH_MAX];
 static char logPath[PATH_MAX];
 static char scanRoot[PATH_MAX];
+static char quarantineDir[PATH_MAX];
 static int pathsReady = 0;
 
 static void pickPath(char *dst, const char *envName, const char *base, const char *suffix){
@@ -39,6 +38,7 @@ void annaInitPaths(){
 
       pickPath(dbDir, "ANNAKAV_DB", cwd, "db/");
       pickPath(logPath, "ANNAKAV_LOG", cwd, "log.bin");
+      pickPath(quarantineDir, "ANNAKAV_QUARANTINE", cwd, "quarantine");
 
       const char *root = getenv("ANNAKAV_SCAN_ROOT");
       if (root == NULL || root[0] == '\0') root = getenv("HOME");
@@ -63,6 +63,11 @@ const char * annaScanRoot(){
       return scanRoot;
 }
 
+const char * annaQuarantineDir(){
+      annaInitPaths();
+      return quarantineDir;
+}
+
 void Checkpoint(){
       time_t local = time(NULL);
       //fix: O_CREAT needs a mode argument, and O_TRUNC so old data is overwritten
@@ -82,8 +87,7 @@ time_t readCheckpoint(){
       //fix: read from the same file Checkpoint() writes to
       int Fp = open(annaLogPath(), O_RDONLY);
       if (Fp == -1) {
-            perror("An error encountered while trying to open the file from reading function");
-            return 0;
+            return 0; //No checkpoint yet -> treat as 0 (full scan)
       }
       if (read(Fp, &readloc, sizeof(time_t)) != (ssize_t)sizeof(time_t)){
             readloc = 0;   //empty / corrupted log.bin -> treat as "never scanned"

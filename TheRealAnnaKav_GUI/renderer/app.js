@@ -1,7 +1,6 @@
 let currentTargets = [];
 
-// Escape semua data dinamis (nama file, path, dll) sebelum dimasukkan ke innerHTML
-// agar nama file berbahaya seperti `<img src=x onerror=...>.exe` tidak dieksekusi (XSS).
+// Escape semua data dinamis sebelum dimasukkan ke innerHTML (mencegah XSS)
 function escapeHtml(value) {
   return String(value ?? '')
     .replace(/&/g, '&amp;')
@@ -9,6 +8,13 @@ function escapeHtml(value) {
     .replace(/>/g, '&gt;')
     .replace(/"/g, '&quot;')
     .replace(/'/g, '&#39;');
+}
+
+const mascotImg = document.getElementById('mascotImg');
+if (mascotImg) {
+  mascotImg.addEventListener('error', () => {
+    mascotImg.style.display = 'none';
+  });
 }
 
 // Tab Navigation
@@ -22,6 +28,7 @@ document.querySelectorAll('.nav-item').forEach(btn => {
     document.getElementById(`tab-${tab}`).classList.add('active');
 
     if (tab === 'hashmap') loadHashmapTable();
+    if (tab === 'quarantine') loadQuarantineTable();
     if (tab === 'security') loadSecurityStatus();
   });
 });
@@ -40,16 +47,25 @@ document.getElementById('btnClearLog').addEventListener('click', () => {
 
 // Load initial hashmap on startup
 async function initApp() {
-  const data = await window.annaKav.getHashmap();
-  const filled = data.hashtable.filter(Boolean).length;
-  document.getElementById('statHmLoaded').textContent = `${filled} / 10`;
-  appendLog('=== TheRealAnnaKav v0.1.4 Initialized (hmload) ===\n');
-  data.logs.forEach(l => appendLog(l + '\n'));
-  loadHashmapTable();
+  try {
+    const data = await window.annaKav.getHashmap();
+    const filled = data.hashtable.filter(Boolean).length;
+    const cap = data.capacity || data.hashtable.length;
+    document.getElementById('statHmLoaded').textContent = `${filled} / ${cap}`;
+    appendLog(`=== TheRealAnnaKav v0.1.5 Initialized (hmload: ${filled}/${cap} slots) ===\n`);
+    data.logs.forEach(l => appendLog(l + '\n'));
+    loadHashmapTable();
+  } catch (err) {
+    appendLog(`[ERROR] Gagal memuat Hashmap: ${err.message}\n`);
+  }
 }
 
 async function loadHashmapTable() {
   const data = await window.annaKav.getHashmap();
+  const filled = data.hashtable.filter(Boolean).length;
+  const cap = data.capacity || data.hashtable.length;
+  document.getElementById('statHmLoaded').textContent = `${filled} / ${cap}`;
+
   const tbody = document.getElementById('hmTableBody');
   tbody.innerHTML = data.hashtable.map((slot, idx) => {
     if (!slot) {
@@ -100,16 +116,17 @@ async function runScan() {
   }
   document.getElementById('statStatus').textContent = 'SCANNING...';
   const onlyExecutable = document.getElementById('chkExecOnly').checked;
+  const incrementalCheckpoint = document.getElementById('chkIncremental').checked;
 
-  appendLog('\n--- Memulai dfsWalker() & Hashmap Lookup ---\n');
+  appendLog('\n--- Memulai dfsWalker() & O(1) Hashmap Lookup ---\n');
   let res;
   try {
     res = await window.annaKav.scanTargets({
       targetPaths: currentTargets,
-      onlyExecutable
+      onlyExecutable,
+      incrementalCheckpoint
     });
   } catch (err) {
-    // Tanpa ini status tertahan di "SCANNING..." bila IPC gagal
     document.getElementById('statStatus').textContent = 'ERROR';
     appendLog(`[ERROR] Scan gagal: ${err.message}\n`);
     return;
@@ -125,19 +142,41 @@ async function runScan() {
     return;
   }
 
-  tbody.innerHTML = res.results.map(r => {
+  tbody.innerHTML = res.results.map((r, idx) => {
     let badgeClass = 'clean';
     if (r.status === 'MALWARE DETECTED') badgeClass = 'malware';
     if (r.status.startsWith('SKIPPED')) badgeClass = 'skip';
+
+    const quarantineBtn = r.status === 'MALWARE DETECTED'
+      ? ` <button class="btn-mini btn-danger-mini" data-q-idx="${idx}" title="Pindahkan file ini ke folder quarantine/">🛡️ Karantina</button>`
+      : '';
 
     return `<tr>
       <td><strong>${escapeHtml(r.fileName)}</strong><br/><small style="color:#8b92a5">${escapeHtml(r.filePath)}</small></td>
       <td>${escapeHtml(r.size)} B</td>
       <td class="mono">${escapeHtml(r.shaHex)}</td>
       <td>${escapeHtml(r.matchedDb)}</td>
-      <td><span class="badge ${badgeClass}">${escapeHtml(r.status)}</span></td>
+      <td><span class="badge ${badgeClass}">${escapeHtml(r.status)}</span>${quarantineBtn}</td>
     </tr>`;
   }).join('');
+
+  tbody.querySelectorAll('[data-q-idx]').forEach(btn => {
+    btn.addEventListener('click', async () => {
+      const item = res.results[Number(btn.getAttribute('data-q-idx'))];
+      if (!item) return;
+      try {
+        await window.annaKav.quarantineFile({
+          filePath: item.filePath,
+          matchedDb: item.matchedDb,
+          shaHex: item.shaHex
+        });
+        btn.textContent = '✓ Dikarantina';
+        btn.disabled = true;
+      } catch (err) {
+        alert('Gagal mengkarantina: ' + err.message);
+      }
+    });
+  });
 }
 
 document.getElementById('btnRunScan').addEventListener('click', runScan);
@@ -168,7 +207,55 @@ document.getElementById('btnRwGenerate').addEventListener('click', async () => {
   }
 });
 
-// Tab 4: Security & Checkpoint
+// Tab 4: Quarantine Vault (v0.1.5)
+async function loadQuarantineTable() {
+  const list = await window.annaKav.getQuarantineList();
+  const tbody = document.getElementById('quarantineTableBody');
+  if (!list.length) {
+    tbody.innerHTML = '<tr><td colspan="5" class="empty">Belum ada file di dalam karantina.</td></tr>';
+    return;
+  }
+
+  tbody.innerHTML = list.map(item => {
+    const dt = new Date(item.quarantinedAt).toLocaleString('id-ID');
+    return `<tr>
+      <td><strong>${escapeHtml(item.originalName)}</strong><br/><small style="color:#8b92a5">${escapeHtml(item.originalPath)}</small></td>
+      <td><span class="badge malware">${escapeHtml(item.matchedDb)}</span></td>
+      <td class="mono">${escapeHtml(item.shaHex)}</td>
+      <td>${escapeHtml(dt)}</td>
+      <td>
+        <button class="btn-mini" data-restore-id="${escapeHtml(item.id)}">↩ Restore</button>
+        <button class="btn-mini btn-danger-mini" data-delete-id="${escapeHtml(item.id)}">🗑 Hapus</button>
+      </td>
+    </tr>`;
+  }).join('');
+
+  tbody.querySelectorAll('[data-restore-id]').forEach(btn => {
+    btn.addEventListener('click', async () => {
+      try {
+        await window.annaKav.restoreQuarantine(btn.getAttribute('data-restore-id'));
+        loadQuarantineTable();
+      } catch (err) {
+        alert('Gagal memulihkan: ' + err.message);
+      }
+    });
+  });
+
+  tbody.querySelectorAll('[data-delete-id]').forEach(btn => {
+    btn.addEventListener('click', async () => {
+      try {
+        await window.annaKav.deleteQuarantine(btn.getAttribute('data-delete-id'));
+        loadQuarantineTable();
+      } catch (err) {
+        alert('Gagal menghapus: ' + err.message);
+      }
+    });
+  });
+}
+
+document.getElementById('btnRefreshQuarantine').addEventListener('click', loadQuarantineTable);
+
+// Tab 5: Security & Checkpoint
 async function loadSecurityStatus() {
   const sec = await window.annaKav.getSecurityStatus();
   document.getElementById('secPasswd').textContent = `/etc/passwd -> Mode: ${sec.passwdMode}`;

@@ -223,6 +223,21 @@ button {
   font-size: 0.72rem;
 }
 
+.btn-danger-mini {
+  color: var(--danger);
+  border-color: rgba(255, 77, 79, 0.45);
+}
+
+.btn-danger-mini:hover {
+  background: rgba(255, 77, 79, 0.18);
+}
+
+.filter-checks {
+  display: flex;
+  align-items: center;
+  gap: 16px;
+}
+
 .filter-bar {
   display: flex;
   justify-content: space-between;

@@ -48,3 +48,11 @@ This patch is about improving performance.
 i pray for an O(1) complexity for malware lookup function. So how can i accomplish it?. By using hashmap instead of Linear Comparison.
 
 on this date 2026-10-17, i plan to leap from v0.1.x to v0.2.x, the motivation behind this action is because i fond that static analysis is the least reliable methodology in detecting malware.
+
+
+# v0.1.5 Final Static Engine Polish: Dynamic Hashmap, Incremental Checkpoint & Quarantine
+
+1. **Dynamic Hashmap (`hashmap.c`, `sha.h`)**: Replaced fixed `SL = 10` static array with a dynamically allocated hashmap starting at `SL = 16` that automatically resizes 2x when the load factor reaches 70%.
+2. **Incremental Checkpoint Scan (`util.c`, `chprelated.c`)**: Activated `readCheckpoint()` comparison against `file.st_mtime` so unchanged files since the last `log.bin` timestamp can be skipped.
+3. **Quarantine Vault (`util.c`, `main.js`, GUI Tab 04)**: Added `quarantineFile()` to strip execute permissions and isolate detected threats into `quarantine/` with Restore and Delete capabilities in the GUI.
+4. **O(1) Hashmap `get()` in GUI & Security Hardening**: Replaced `scanf` with `fgets` in `WAFPrev()`, added `stat()` error checks, removed duplicate table printing in `hmload()`, and enforced `Content-Security-Policy` in the Electron GUI.
